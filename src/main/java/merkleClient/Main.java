@@ -19,8 +19,9 @@ public class Main {
 								 									.build()
 								 									.checkWhichTransactionValid();		
 		//print the valid transactions.
-		report.entrySet().stream()
-						 .filter(Entry::getKey)
-						 .forEach(Entry::getValue);
+		report.forEach((key, list)->{
+			System.out.println(key);
+			list.forEach(req->System.out.println(req));
+		});
 	}	
 }

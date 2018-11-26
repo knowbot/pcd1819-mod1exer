@@ -1,12 +1,17 @@
 package merkleClient;
 
 import java.io.*;
-import java.net.Socket;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.util.*;
 
 import static merkleClient.HashUtil.md5Java;
 
 public class MerkleValidityRequest {
+
+	public static String END_SESSION_MSG = "exit";
+	public static String END_TRANSMISSION_MSG = "done";
 
 	/**
 	 * IP address of the authority
@@ -36,7 +41,21 @@ public class MerkleValidityRequest {
 		this.mRoot = b.mRoot;
 		this.mRequests = b.mRequest;
 	}
-	
+
+	/**
+	 * 	Prints a (normal, error) message of choice.
+	 *
+	 *  @param msg String: message to be displayed
+	 *  @param mode String: nature of the message
+	 * */
+	private static void log(String msg, String mode) {
+		switch(mode) {
+			case "out": {System.out.println(msg); break;}
+			case "err": {System.err.println(msg); break;}
+			default: {}
+		}
+	}
+
 	/**
 	 * <p>Method implementing the communication protocol between the client and the authority.</p>
 	 * <p>The steps involved are as follows:</p>
@@ -49,7 +68,7 @@ public class MerkleValidityRequest {
 	 *
 	 * 	<p>Addition to original function:</p>
 	 *
-	 * 	<p>Uses the utility method {@link #getNodesFromServer(Socket, String) getNodesFromServer}</p>
+	 * 	<p>Uses the utility method {@link #getNodesFromServer(SocketChannel, String) getNodesFromServer}</p>
 	 * 	<p>method to request and read the node hashes from the server.</p>
 	 * */
 	public Map<Boolean, List<String>> checkWhichTransactionValid() throws IOException {
@@ -60,20 +79,32 @@ public class MerkleValidityRequest {
 		/*
 			Open connection to server
 		 */
-		try (Socket authSocket = new Socket(authIPAddr, authPort)){
-			 mRequests.stream()
+		try {
+			InetSocketAddress serverRemoteAddr = new InetSocketAddress(authIPAddr, authPort);
+			SocketChannel authSocket = SocketChannel.open(serverRemoteAddr);
+
+			log("Connecting to server on port " + authPort + "...", "out");
+			mRequests.add(END_SESSION_MSG);
+			mRequests.stream()
 					.forEach(request -> {
 						/*
 						 * !!! Lambdas should be short and easy to read: hence why I moved the communication protocol
 						 * into the (properly documented) dedicated function getNodesFromServer !!!
 						 */
-						List<String> mNodes = getNodesFromServer(authSocket, request);
-						boolean validityProof = isTransactionValid(request, mNodes);
-						checkedTransactions.get(validityProof).add(request);
+						if(!request.equals(END_SESSION_MSG)) {
+							List<String> mNodes = getNodesFromServer(authSocket, request);
+							boolean validityProof = isTransactionValid(request, mNodes);
+							checkedTransactions.get(validityProof).add(request);
+						}
 					});
+
+			log("All requests have been evaluated.\nAttempting to disconnect...", "out");
+			byte[] exitReqMsg = ("Close this connection :"+END_SESSION_MSG).getBytes();
+			ByteBuffer exitRequest = ByteBuffer.wrap(exitReqMsg);
+			authSocket.write(exitRequest);
+			authSocket.close();
 		} catch (IOException e) {
-			System.out.println("Connection to server failed.\n" +
-								"Aborting operation...\n");
+			log("Unable to establish a connection with the server...","err");
 		}
 		return checkedTransactions;
 	}
@@ -81,35 +112,57 @@ public class MerkleValidityRequest {
 	/**
 	 * 	Handles communication between client and server.
 	 *
-	 *  @param authSocket Socket: the socket from which the client communicates with the server
+	 *  @param authSocket SocketChannel: the socket from which the client communicates with the server
 	 *  @param request String: hash code of the transaction we ask to validate
 	 *
 	 *  @return: list of node hashes received from the server
 	 * */
-	private List<String> getNodesFromServer (Socket authSocket, String request) {
+	private List<String> getNodesFromServer (SocketChannel authSocket, String request) {
 		List<String> receivedNodes = new ArrayList<>();
 		/*
 			Ask server to provide the necessary node hashes to validate the transaction
 		 */
-		try (PrintWriter out = new PrintWriter(new OutputStreamWriter(authSocket.getOutputStream()),true)){
-			String validityReqMsg = "Requesting node hashes to validate transaction...\n";
-			out.write(validityReqMsg);
-			out.write(request);
-			/*
-				Attempt to read node hashes from server
-			*/
-			try (BufferedReader in = new BufferedReader(new InputStreamReader(authSocket.getInputStream()))) {
-				String nodeHash = in.readLine();
-				while (nodeHash != null && !(nodeHash.equals("done"))) {
-					receivedNodes.add(nodeHash);
-					nodeHash = in.readLine();
+		log("Requesting nodes to validate transaction '"+request+"' ...","out");
+		byte[] validityReqMsg = ("Send nodes to validate transaction :"+request).getBytes();
+		ByteBuffer outgoingRequest = ByteBuffer.wrap(validityReqMsg);
+
+		try {
+			authSocket.write(outgoingRequest);
+			outgoingRequest.clear();
+
+			if(!request.equals(END_SESSION_MSG)) {
+				ByteBuffer nodeBuffer = ByteBuffer.allocate(256);
+				String incomingNode;
+				log("Listening for new nodes...","out");
+				try {
+					/*
+						Attempts to read nodes from the server
+					 */
+					authSocket.read(nodeBuffer);
+					incomingNode = new String(nodeBuffer.array()).trim();
+					while (!incomingNode.equals(END_TRANSMISSION_MSG)) {
+						log("Received node " + incomingNode + "...", "out");
+						receivedNodes.add(incomingNode);
+						/*
+							Reset the buffer so the client can actually read the end of transmission message, since
+							it's shorter than a hash and clear() doesn't actually empty the buffer.
+						 */
+						nodeBuffer.clear();
+						nodeBuffer.put(new byte[nodeBuffer.capacity()]);
+						nodeBuffer.clear();
+
+						authSocket.read(nodeBuffer);
+						incomingNode = new String(nodeBuffer.array()).trim();
+					}
+
+				} catch (IOException e) {
+					log("Error while reading nodes from server.","err");
 				}
-			} catch (IOException e) {
-				System.out.println("Unable to read input stream from the server.\n");
 			}
 		} catch (IOException e) {
-			System.out.println("Validation request to server failed.\n");
+			log("Unable to send validation request to server, skipping transaction " + request + "...","err");
 		}
+		log("All nodes for transaction " + request + " have been received.","out");
 		return receivedNodes;
 	}
 
